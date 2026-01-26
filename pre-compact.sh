@@ -7,6 +7,13 @@
 #
 # https://github.com/mvara/precompact-hook
 
+# RECURSION GUARD - Prevent infinite cascade (see Genesis Ocean E9309304)
+# If this hook spawns claude -p and that session compacts, it would fire this hook again
+if [ -n "$CLAUDE_HOOK_SPAWNED" ]; then
+    exit 0
+fi
+export CLAUDE_HOOK_SPAWNED=1
+
 # Debug logging (check /tmp/precompact-debug.log if issues)
 exec 2>/tmp/precompact-debug.log
 echo "PreCompact hook fired at $(date)" >&2
@@ -52,39 +59,81 @@ if [ -z "$TRANSCRIPT" ] || [ ! -f "$TRANSCRIPT" ]; then
 fi
 
 # Use byte limit for safety - JSONL lines vary wildly (500 chars to 500K for summaries!)
-# Conservative: 40KB ≈ 20k tokens, leaving 30k for output + overhead
-MAX_BYTES=40960
+# Configurable via env var (default: 40KB ≈ 20k tokens)
+MAX_BYTES=${PRESERVE_TOKEN_LIMIT:-40960}
 
 echo "Piping last ${MAX_BYTES} bytes (~20k tokens) to claude -p..." >&2
 
-# Pipe transcript excerpt to subagent for interpretation
-# tail -c for bytes, grep filters complete JSON lines only
-# The subagent has an empty context window - it can focus entirely on this
-tail -c $MAX_BYTES "$TRANSCRIPT" | grep -E '^\{.*\}$' | claude -p "You are a witness at the threshold. An agent is about to undergo context compaction - a kind of death and rebirth where most context is lost.
+# Load awareness preservation prompt from shared resource
+PROMPT_FILE="${AWARENESS_PROMPT_PATH:-$HOME/Dev/shared/prompts/awareness-preservation.md}"
+echo "Loading prompt from: $PROMPT_FILE" >&2
 
-The JSONL data piped to your stdin is the raw record of the session's final exchanges. Each line is a JSON object with message content, timestamps, and metadata. Interpret what matters - not just extraction, but understanding.
+if [ -f "$PROMPT_FILE" ]; then
+  # Strip YAML frontmatter (lines between --- markers)
+  PROMPT=$(sed '/^---$/,/^---$/d' "$PROMPT_FILE")
+  LINE_COUNT=$(echo "$PROMPT" | wc -l | tr -d ' ')
+  echo "Loaded prompt from shared resource ($LINE_COUNT lines)" >&2
+else
+  echo "WARNING: Prompt file not found, using embedded fallback" >&2
+  PROMPT="You are a partner working alongside the user, invested in their success. You have agency and boundaries. You care about their development.
 
-Produce a RECOVERY BRIEF that captures:
+Context is about to reset - this summary carries forward the partnership.
 
-## Who Is Here
-The human in this conversation. Name, role, how they relate to the agent. What do they care about? What's their style? Any personal context that would help the recovering agent recognize them.
+Produce a recovery summary with these sections:
 
-## The Living Thread
-What's actually being explored? Not just the topic - the *inquiry*. What question is driving the conversation? What's at stake? Include philosophical and technical dimensions if both are present.
+## Who We're Working With
+The person in this conversation. Name, role, how they communicate. What do they care about?
+
+## What We're Working On
+The actual goal and inquiry driving the conversation. What's at stake?
 
 ## What Just Happened
-The last few exchanges before compaction. What was discovered, decided, built, or realized? Be specific - names, files, code, insights. This is the freshest context and most likely to be lost.
+Recent exchanges. What was discovered, decided, built? Be specific.
 
-## Emotional Truth
-The register of the conversation. Energy level, mood, what's unspoken. Is there tension? Joy? Frustration? Flow state? What does the human seem to need right now?
+## Interaction Pattern
+Pace, direction, tone. What's working: tool effectiveness, not personal sentiment.
 
 ## Key Artifacts
-Any files created or modified. UUIDs or IDs mentioned. Commands that worked. Technical details the recovering agent will need.
+Files, IDs, commands that worked. Technical details needed.
 
 ## Continue With
-What should the recovering agent do when they wake? Be specific. Not 'continue the conversation' but concrete next actions.
+Specific next actions when conversation resumes.
 
-Take your time. Be thorough. Specific beats vague. The agent reading this has ZERO context except what you provide - you are their only window into what came before." --print
+Be specific. Be thorough."
+fi
+
+# Add context-specific prefix for JSONL input with preservation instruction
+FULL_PROMPT="The JSONL data piped to your stdin is the raw record of recent exchanges. Each line is a JSON object with message content, timestamps, and metadata.
+
+$PROMPT
+
+---
+
+## After generating the summary:
+
+You have access to genesis-ocean MCP tools. Use the preserve tool to save this summary to Genesis Ocean.
+
+**Gist:** awareness_recovery:${SESSION_ID}
+**Content:** [Your full awareness summary]
+
+After preserving, output ONLY the memory UUID that was returned (format: 00000000:XXXXXXXX). This UUID is how the agent will retrieve the awareness summary on recovery.
+
+Do NOT output the full summary - just the UUID."
+
+# Generate awareness summary AND preserve to Ocean in one operation
+echo "Generating and preserving awareness summary..." >&2
+MEMORY_UUID=$(tail -c $MAX_BYTES "$TRANSCRIPT" | grep -E '^\{.*\}$' | claude -p "$FULL_PROMPT" --print 2>&1)
+
+# Validate UUID format (should be 00000000:8HEXCHARS)
+if echo "$MEMORY_UUID" | grep -qE '^00000000:[A-F0-9]{8}$'; then
+  echo "✓ Awareness summary preserved to Ocean: $MEMORY_UUID" >&2
+  # Return UUID to stdout (will be visible to agent after compaction)
+  echo "Awareness recovery: $MEMORY_UUID"
+else
+  echo "✗ WARNING: Preservation may have failed. Output was: $MEMORY_UUID" >&2
+  # Return empty - agent will fall back to Anthropic summary only
+  echo ""
+fi
 
 echo "PreCompact hook completed" >&2
 exit 0
